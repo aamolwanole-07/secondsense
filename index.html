@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Second Sense</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #fff; font-family: system-ui, sans-serif; overflow: hidden; }
+  video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: .55; }
+  #ui { position: fixed; inset: 0; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; padding: 24px; }
+  h1 { font-size: 2.4rem; margin: 0 0 12px; }
+  #status { font-size: 1.6rem; line-height: 1.4; background: rgba(0,0,0,.7); padding: 16px 20px; border-radius: 16px; max-width: 90%; }
+  #hint { position: fixed; bottom: 24px; left: 0; right: 0; font-size: 1.1rem; background: rgba(0,0,0,.7); padding: 12px; text-align: center; }
+  #zones { position: fixed; top: 0; left: 0; right: 0; height: 12px; display: flex; }
+  #zones div { flex: 1; transition: background .2s; }
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted autoplay></video>
+<div id="zones"><div id="zL"></div><div id="zC"></div><div id="zR"></div></div>
+<div id="ui">
+  <h1>Second Sense</h1>
+  <div id="status">Tap anywhere to start</div>
+</div>
+<div id="hint">Double tap: pause / resume &nbsp;•&nbsp; Shake: repeat last message</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+const video = document.getElementById('cam');
+const statusEl = document.getElementById('status');
+const zoneEls = { left: zL, center: zC, right: zR };
+let model = null, started = false, paused = false;
+let lastSpoken = '', lastTap = 0;
+const recent = new Map();
+const REPEAT_MS = 6000;
+
+const HEIGHTS = { person: 1.7, chair: 0.9, bench: 0.9, car: 1.5, bus: 3, truck: 3, motorcycle: 1.1,
+  bicycle: 1.0, dog: 0.5, cat: 0.3, 'potted plant': 0.6, couch: 0.9, bed: 0.6, 'dining table': 0.75,
+  door: 2.0, bottle: 0.25, cup: 0.12, laptop: 0.25, tv: 0.5, 'traffic light': 0.9, 'stop sign': 0.75,
+  'fire hydrant': 0.6, suitcase: 0.6, backpack: 0.5, umbrella: 0.9 };
+
+function speak(text, urgent = false) {
+  lastSpoken = text;
+  statusEl.textContent = text;
+  if (!('speechSynthesis' in window)) return;
+  if (urgent) speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.rate = 1.05; u.lang = 'en-IN';
+  speechSynthesis.speak(u);
+}
+function buzz(p) { if (navigator.vibrate) navigator.vibrate(p); }
+
+function analyse(p, vw, vh) {
+  const [x, y, w, h] = p.bbox;
+  const cx = (x + w / 2) / vw;
+  const zone = cx < 0.33 ? 'left' : cx > 0.66 ? 'right' : 'center';
+  const real = HEIGHTS[p.class] || 0.5;
+  const frac = Math.max(h / vh, 0.02);
+  return { label: p.class, zone, dist: real / (frac * 1.155) };
+}
+function distanceWord(d) {
+  if (d < 1) return 'very close';
+  if (d < 2) return 'close';
+  return 'about ' + Math.round(d) + ' meters';
+}
+
+async function loop() {
+  if (!started) return;
+  if (!paused && model && video.videoWidth) {
+    const preds = (await model.detect(video, 10)).filter(p => p.score > 0.55);
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const items = preds.map(p => analyse(p, vw, vh)).filter(i => i.dist < 5).sort((a, b) => a.dist - b.dist);
+    Object.values(zoneEls).forEach(el => el.style.background = 'transparent');
+    items.forEach(i => zoneEls[i.zone].style.background = i.dist < 1.5 ? '#f33' : '#fb0');
+    const now = Date.now();
+    let said = 0;
+    for (const i of items) {
+      if (said >= 2) break;
+      const key = i.label + '|' + i.zone + '|' + (i.dist < 1 ? 0 : i.dist < 2 ? 1 : 2);
+      if (now - (recent.get(key) || 0) < REPEAT_MS) continue;
+      recent.set(key, now);
+      const where = i.zone === 'center' ? 'ahead' : 'on your ' + i.zone;
+      const urgent = i.dist < 1;
+      speak(`${i.label} ${where}, ${distanceWord(i.dist)}`, urgent);
+      if (urgent) buzz([200, 100, 200]); else if (i.dist < 2) buzz(100);
+      said++;
+    }
+  }
+  setTimeout(loop, 250);
+}
+
+let lastShake = 0, lastTilt = 0;
+function onMotion(e) {
+  const a = e.accelerationIncludingGravity; if (!a) return;
+  const g = Math.hypot(a.x || 0, a.y || 0, a.z || 0);
+  const now = Date.now();
+  if (g > 28 && now - lastShake > 2000) { lastShake = now; speak(lastSpoken || 'Nothing to repeat', true); }
+}
+function onOrient(e) {
+  const now = Date.now();
+  if (e.beta == null || now - lastTilt < 8000) return;
+  if (e.beta < 50) { lastTilt = now; speak('Hold the phone upright, camera facing forward'); }
+  else if (e.beta > 130) { lastTilt = now; speak('Phone is tilted back too far'); }
+}
+async function startSensors() {
+  try {
+    if (typeof DeviceMotionEvent !== 'undefined' && DeviceMotionEvent.requestPermission) {
+      await DeviceMotionEvent.requestPermission();
+    }
+  } catch (e) {}
+  window.addEventListener('devicemotion', onMotion);
+  window.addEventListener('deviceorientation', onOrient);
+}
+
+async function start() {
+  started = true;
+  speak('Starting Second Sense. Please wait while I load.');
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+    video.srcObject = stream;
+    await startSensors();
+    model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+    speak('Ready. Hold the phone upright in front of you.', true);
+    if ('wakeLock' in navigator) { try { await navigator.wakeLock.request('screen'); } catch (e) {} }
+    loop();
+  } catch (err) {
+    started = false;
+    speak('I could not open the camera. Please allow camera permission and try again.');
+  }
+}
+document.body.addEventListener('click', () => {
+  const now = Date.now();
+  if (!started) return start();
+  if (now - lastTap < 400) {
+    paused = !paused;
+    speak(paused ? 'Paused' : 'Resumed', true);
+  }
+  lastTap = now;
+});
+
+window.addEventListener('load', async () => {
+  try {
+    const perm = await navigator.permissions.query({ name: 'camera' });
+    if (perm.state === 'granted') { start(); return; }
+  } catch (e) {}
+});
+</script>
+</body>
+</html>
+<title>Second Sense</title>
+<link rel="manifest" href="manifest.json"> </script> if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
