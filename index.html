@@ -2,15 +2,22 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
 <title>Second Sense</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" type="image/png" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <style>
-  html, body { margin: 0; height: 100%; background: #000; color: #fff; font-family: system-ui, sans-serif; overflow: hidden; }
+  html, body { margin: 0; height: 100%; background: #000; color: #fff; font-family: system-ui, sans-serif; overflow: hidden;
+    user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; touch-action: manipulation; }
   video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: .55; }
   #ui { position: fixed; inset: 0; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; padding: 24px; }
   h1 { font-size: 2.4rem; margin: 0 0 12px; }
-  #status { font-size: 1.6rem; line-height: 1.4; background: rgba(0,0,0,.7); padding: 16px 20px; border-radius: 16px; max-width: 90%; }
-  #hint { position: fixed; bottom: 24px; left: 0; right: 0; font-size: 1.1rem; background: rgba(0,0,0,.7); padding: 12px; text-align: center; }
+  #status { font-size: 1.6rem; line-height: 1.4; background: rgba(0,0,0,.7); padding: 16px 20px; border-radius: 16px; max-width: 90%; max-height: 38vh; overflow: hidden; }
+  #readBtn { position: fixed; left: 16px; right: 16px; bottom: 104px; font-size: 1.7rem; font-weight: 700; padding: 20px;
+    background: #ffd600; color: #000; border: 0; border-radius: 18px; }
+  #hint { position: fixed; bottom: 24px; left: 0; right: 0; font-size: 1.05rem; background: rgba(0,0,0,.7); padding: 12px; text-align: center; }
   #zones { position: fixed; top: 0; left: 0; right: 0; height: 12px; display: flex; }
   #zones div { flex: 1; transition: background .2s; }
 </style>
@@ -22,24 +29,32 @@
   <h1>Second Sense</h1>
   <div id="status">Tap anywhere to start</div>
 </div>
-<div id="hint">Double tap: pause / resume &nbsp;•&nbsp; Shake: repeat last message</div>
+<button id="readBtn" type="button">Read text</button>
+<div id="hint">Hold screen: read text &nbsp;•&nbsp; Double tap: pause &nbsp;•&nbsp; Shake: repeat</div>
+<canvas id="snap" hidden></canvas>
 
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
 <script>
 const video = document.getElementById('cam');
 const statusEl = document.getElementById('status');
+const readBtn = document.getElementById('readBtn');
+const canvas = document.getElementById('snap');
 const zoneEls = { left: zL, center: zC, right: zR };
-let model = null, started = false, paused = false;
+
+let model = null, started = false, paused = false, reading = false;
 let lastSpoken = '', lastTap = 0;
 const recent = new Map();
 const REPEAT_MS = 6000;
 
+// Approximate real-world heights (metres) used to estimate distance
 const HEIGHTS = { person: 1.7, chair: 0.9, bench: 0.9, car: 1.5, bus: 3, truck: 3, motorcycle: 1.1,
   bicycle: 1.0, dog: 0.5, cat: 0.3, 'potted plant': 0.6, couch: 0.9, bed: 0.6, 'dining table': 0.75,
   door: 2.0, bottle: 0.25, cup: 0.12, laptop: 0.25, tv: 0.5, 'traffic light': 0.9, 'stop sign': 0.75,
   'fire hydrant': 0.6, suitcase: 0.6, backpack: 0.5, umbrella: 0.9 };
 
+// ---------- Voice ----------
 function speak(text, urgent = false) {
   lastSpoken = text;
   statusEl.textContent = text;
@@ -51,6 +66,31 @@ function speak(text, urgent = false) {
 }
 function buzz(p) { if (navigator.vibrate) navigator.vibrate(p); }
 
+// Speaks long text (like a page of a sign) in short pieces so the phone does not cut it off
+function speakLong(text) {
+  text = text.slice(0, 900);
+  lastSpoken = text;
+  statusEl.textContent = text.length > 300 ? text.slice(0, 300) + '…' : text;
+  if (!('speechSynthesis' in window)) return;
+  speechSynthesis.cancel();
+  const parts = [];
+  text.split(/(?<=[.!?])\s+/).forEach(s => {
+    while (s.length > 180) {
+      let i = s.lastIndexOf(' ', 180);
+      if (i < 40) i = 180;
+      parts.push(s.slice(0, i));
+      s = s.slice(i).trim();
+    }
+    if (s) parts.push(s);
+  });
+  parts.forEach(p => {
+    const u = new SpeechSynthesisUtterance(p);
+    u.rate = 1.0; u.lang = 'en-IN';
+    speechSynthesis.speak(u);
+  });
+}
+
+// ---------- Distance + direction ----------
 function analyse(p, vw, vh) {
   const [x, y, w, h] = p.bbox;
   const cx = (x + w / 2) / vw;
@@ -65,14 +105,17 @@ function distanceWord(d) {
   return 'about ' + Math.round(d) + ' meters';
 }
 
+// ---------- Detection loop ----------
 async function loop() {
   if (!started) return;
   if (!paused && model && video.videoWidth) {
     const preds = (await model.detect(video, 10)).filter(p => p.score > 0.55);
     const vw = video.videoWidth, vh = video.videoHeight;
     const items = preds.map(p => analyse(p, vw, vh)).filter(i => i.dist < 5).sort((a, b) => a.dist - b.dist);
+
     Object.values(zoneEls).forEach(el => el.style.background = 'transparent');
     items.forEach(i => zoneEls[i.zone].style.background = i.dist < 1.5 ? '#f33' : '#fb0');
+
     const now = Date.now();
     let said = 0;
     for (const i of items) {
@@ -90,6 +133,61 @@ async function loop() {
   setTimeout(loop, 250);
 }
 
+// ---------- Text reading (OCR) ----------
+let readerPromise = null;
+function getReader() {
+  if (!readerPromise) {
+    readerPromise = Tesseract.createWorker('eng').catch(e => { readerPromise = null; throw e; });
+  }
+  return readerPromise;
+}
+
+function cleanText(raw) {
+  return raw.split('\n')
+    .map(l => l.replace(/[^\p{L}\p{N}\s.,:;!?'"()\-\/&%$@#+=]/gu, ' ').replace(/\s+/g, ' ').trim())
+    .filter(l => {
+      const good = (l.match(/[\p{L}\p{N}]/gu) || []).length;
+      return l.length >= 2 && good / l.length >= 0.6;
+    })
+    .join('. ')
+    .replace(/\.\s*\./g, '.');
+}
+
+async function readText() {
+  if (reading) return;
+  if (!started) { start(); return; }
+  if (!video.videoWidth) { speak('The camera is not ready yet. Please wait.', true); return; }
+  reading = true;
+  const wasPaused = paused;
+  paused = true;
+  Object.values(zoneEls).forEach(el => el.style.background = 'transparent');
+  speak('Reading text. Hold the phone steady.', true);
+  buzz(80);
+  try {
+    const worker = await getReader();
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const scale = Math.min(1, 1600 / Math.max(vw, vh));
+    canvas.width = Math.round(vw * scale);
+    canvas.height = Math.round(vh * scale);
+    const ctx = canvas.getContext('2d');
+    ctx.filter = 'grayscale(1) contrast(1.4)';
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const { data } = await worker.recognize(canvas);
+    const text = cleanText(data.text || '');
+    if (!text || data.confidence < 35) {
+      speak('I could not read any text. Hold the phone steady, closer to the text, with good light.', true);
+    } else {
+      speakLong(text);
+    }
+  } catch (e) {
+    speak('Sorry, the text reader could not start. Check your internet connection and try again.', true);
+  } finally {
+    reading = false;
+    paused = wasPaused;
+  }
+}
+
+// ---------- Sensors ----------
 let lastShake = 0, lastTilt = 0;
 function onMotion(e) {
   const a = e.accelerationIncludingGravity; if (!a) return;
@@ -99,7 +197,7 @@ function onMotion(e) {
 }
 function onOrient(e) {
   const now = Date.now();
-  if (e.beta == null || now - lastTilt < 8000) return;
+  if (reading || e.beta == null || now - lastTilt < 8000) return;
   if (e.beta < 50) { lastTilt = now; speak('Hold the phone upright, camera facing forward'); }
   else if (e.beta > 130) { lastTilt = now; speak('Phone is tilted back too far'); }
 }
@@ -113,7 +211,9 @@ async function startSensors() {
   window.addEventListener('deviceorientation', onOrient);
 }
 
+// ---------- Start / pause ----------
 async function start() {
+  if (started) return;
   started = true;
   speak('Starting Second Sense. Please wait while I load.');
   try {
@@ -121,15 +221,38 @@ async function start() {
     video.srcObject = stream;
     await startSensors();
     model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
-    speak('Ready. Hold the phone upright in front of you.', true);
+    speak('Ready. Hold the screen for one second to read text.', true);
     if ('wakeLock' in navigator) { try { await navigator.wakeLock.request('screen'); } catch (e) {} }
     loop();
+    // load the text reader in the background so the first read is fast
+    try { getReader().catch(() => {}); } catch (e) {}
   } catch (err) {
     started = false;
     speak('I could not open the camera. Please allow camera permission and try again.');
   }
 }
+
+// ---------- Touch controls ----------
+// Hold the screen ~1 second: read text.  Double tap: pause / resume.
+let pressTimer = null, longPressed = false;
+document.body.addEventListener('pointerdown', e => {
+  if (e.target === readBtn) return;
+  longPressed = false;
+  clearTimeout(pressTimer);
+  if (!started) return;
+  pressTimer = setTimeout(() => { longPressed = true; readText(); }, 800);
+});
+['pointerup', 'pointercancel', 'pointerleave'].forEach(ev =>
+  document.body.addEventListener(ev, () => clearTimeout(pressTimer)));
+document.addEventListener('contextmenu', e => e.preventDefault());
+
+readBtn.addEventListener('click', e => {
+  e.stopPropagation();
+  readText();
+});
+
 document.body.addEventListener('click', () => {
+  if (longPressed) { longPressed = false; return; }
   const now = Date.now();
   if (!started) return start();
   if (now - lastTap < 400) {
@@ -139,7 +262,10 @@ document.body.addEventListener('click', () => {
   lastTap = now;
 });
 
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 window.addEventListener('load', async () => {
+  statusEl.textContent = 'Tap anywhere to start';
+  // If the camera was already allowed on an earlier visit, start automatically
   try {
     const perm = await navigator.permissions.query({ name: 'camera' });
     if (perm.state === 'granted') { start(); return; }
@@ -148,5 +274,3 @@ window.addEventListener('load', async () => {
 </script>
 </body>
 </html>
-<title>Second Sense</title>
-<link rel="manifest" href="manifest.json"> </script> if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
